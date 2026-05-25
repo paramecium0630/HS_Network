@@ -1,0 +1,6 @@
+1d-2 5d-4 10000 ! DD, dt, iseed
+0 .2d0 5 ! idir, prob, Ntau
+15d0 5000 10d0 .5d0 ! period, nreal, tau, bb !nonsteady process
+5.d0 0.5d0 5. 5.  !mean and sig of weighted random graph, mean r
+1 2 ! alpha, beta
+10 ! NN
