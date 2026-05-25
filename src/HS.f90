@@ -69,7 +69,7 @@ program HS_Network
 	   if(idir.eq.1) G(j,i)=G0(j,i)*GAUDEV(w_mean, w_sig, iseed)
 	ENDDO; ENDDO
 
-!dec$if(.true.)
+!dec$if(.false.)
 	G0 = 0
 	open(unit=999, file="input/adjacency_list.txt", status="old", action="read")	
 	do
@@ -178,11 +178,11 @@ program HS_Network
         K_avg(i,j,:) = K_avg(i,j,:) - x_avg(i,:)*x_avg(j,:)
     enddo; enddo
 
-    do i = -npast, nstep
-        if (mod(i, 10) .eq. 1) then  
-            write(15,*) i*dt, x_avg(1,i)
-            write(16,*) i*dt, f_avg(1,i)
-            write(18,*) i*dt, K_avg(1,1,i)
+    do i = -npast/5, nstep
+        if (mod(i+npast, 10) .eq. 1) then  
+            write(15,*) i*dt, x_avg(1,i), x_avg(2,i)
+            write(16,*) i*dt, f_avg(1,i), f_avg(2,i)
+            write(18,*) i*dt, K_avg(1,1,i), K_avg(1,2,i)
         endif
     enddo
 
