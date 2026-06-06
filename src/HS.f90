@@ -7,9 +7,15 @@ program HS_Network
     integer, parameter :: small_blas_threshold = 16
     real(8) :: xKx1, xKx2, hs_functional, hs_functional_avg, exp_minus_hs_avg
     real(8) :: entropy_initial, entropy_final, entropy_change, entropy_change_avg
+    real(8) :: system_entropy_initial, system_entropy_final, system_entropy_change
+    real(8) :: system_entropy_change_avg, total_entropy_production_avg
     real(8) :: logdet_K_start, logdet_K_end, entropy_change_logdet, entropy_change_quadratic_avg
+    real(8) :: logdet_rho_start, logdet_rho_end
     real(8) :: sum_heat, sum_heat_avg, sum_entropy, sum_entropy_avg, sum_work, sum_work_avg
-    real(8) :: tt, tpast, protocol, protocol_next, work_protocol, work_protocol_avg, energy_change_avg    
+    real(8) :: tt, tpast, protocol, protocol_next, work_protocol, work_protocol_step, work_protocol_avg
+    real(8) :: energy_change_avg, energy_initial_direct, energy_final_direct, energy_change_direct
+    real(8) :: energy_change_direct_avg, first_law_residual, first_law_residual_avg
+    real(8) :: first_law_abs_residual_avg
     real(8) :: dum, time1, time2, time1_HS, time2_HS
     real(8) :: DD, dt, prob, W_mean, W_sig, r0, w0, period, tau, bb
     real(8), parameter :: pi = 4d0*atan(1d0)
@@ -21,8 +27,9 @@ program HS_Network
     real(8), allocatable :: inweightdeg(:), outweightdeg(:), GS(:,:), GA(:,:) ! symmetric of G, asymmetric part of G
 
     ! dynamic variables
-    real(8), allocatable :: f1(:), x1(:), noise_increment(:), fluct(:), fluct_prev(:), x_prev(:), f2(:)
-    real(8), allocatable :: node_heat_step(:), node_work_step(:), nc_force_prev(:), nc_force_next(:)
+    real(8), allocatable :: f1(:), x1(:), noise_increment(:), fluct(:), fluct_prev(:), x_prev(:)
+    real(8), allocatable :: node_heat_step(:), node_work_step(:), x_mid(:), force_mid(:), nc_force_mid(:)
+    real(8), allocatable :: energy_work(:)
     real(8), allocatable :: f_avg(:,:), x_avg(:,:), K_avg(:,:,:), fixed_point(:,:)
     real(8), allocatable :: node_heat(:), node_entropy(:), node_work(:)
     ! real(8), allocatable :: protocol(:)
@@ -37,6 +44,7 @@ program HS_Network
     ! energetics
     real(8), allocatable :: node_heat_avg(:), node_entropy_avg(:), node_work_avg(:), node_energy_avg(:)
     real(8), allocatable :: Ko_protocol_start(:,:), Ko_protocol_end(:,:), Ko_inv_protocol(:,:,:), logdet_K(:)
+    real(8), allocatable :: K_inv_start(:,:), K_inv_end(:,:)
 
     call read_variables_from_file()
     if (iread .eq. 1) then
@@ -66,8 +74,8 @@ program HS_Network
     allocate(a(N), r(N), ar(N), noise(N,N), G(N,N), Q(N,N), Q_inv(N,N), noise_scale(N))
     allocate(inweightdeg(N), outweightdeg(N))
 
-    allocate(f1(N), x1(N), noise_increment(N), fluct(N), fluct_prev(N), x_prev(N), f2(N), node_heat_step(N))
-    allocate(node_work_step(N), nc_force_prev(N), nc_force_next(N))
+    allocate(f1(N), x1(N), noise_increment(N), fluct(N), fluct_prev(N), x_prev(N), node_heat_step(N))
+    allocate(node_work_step(N), x_mid(N), force_mid(N), nc_force_mid(N), energy_work(N))
     allocate(node_heat(N), node_entropy(N), node_work(N))
     allocate(f_avg(N, -NPAST:NSTEP), x_avg(N, -NPAST:NSTEP), K_avg(N, N, -NPAST:NSTEP))
 
@@ -78,6 +86,7 @@ program HS_Network
     allocate(lyapunov_residual_start(N,N), lyapunov_residual_end(N,N))
     allocate(Ko_protocol_start(N,N), Ko_protocol_end(N,N))
     allocate(Ko_inv_protocol(N,N,0:NSTEP_PROTOCOL), logdet_K(0:NSTEP_PROTOCOL), fixed_point(N,0:NSTEP_PROTOCOL))
+    allocate(K_inv_start(N,N), K_inv_end(N,N))
 
     allocate(node_heat_avg(N), node_entropy_avg(N), node_work_avg(N), node_energy_avg(N))
 
@@ -97,6 +106,8 @@ program HS_Network
     OPEN(UNIT=23, FILE='output/node_work.dat', STATUS='REPLACE')
     OPEN(UNIT=24, FILE='output/fixed_point.dat', STATUS='REPLACE')
     OPEN(UNIT=25, FILE='output/node_energy.dat', STATUS='REPLACE')
+    OPEN(UNIT=26, FILE='output/first_law.dat', STATUS='REPLACE')
+    write(26,'(A)') '# realization delta_U Q_sys W_nc_env W_proto_on balance residual'
 
     G = 0d0; G0 = 0
     if (iread .eq. 1) then
@@ -248,6 +259,13 @@ program HS_Network
         enddo
     endif
 
+    ! The linear dynamics with additive Gaussian noise has a Gaussian ensemble density.
+    ! Estimate its endpoint covariance from the first ensemble for Formula 9.
+    call matrix_logdet_spd(K_avg(:,:,0), N, logdet_rho_start)
+    call matrix_logdet_spd(K_avg(:,:,NSTEP_PROTOCOL), N, logdet_rho_end)
+    call inverse(N, K_avg(:,:,0), K_inv_start)
+    call inverse(N, K_avg(:,:,NSTEP_PROTOCOL), K_inv_end)
+
     do ii = 0, NSTEP_PROTOCOL
         tt = ii*dt
         call protocol_at_time(tt, tau, bb, protocol)
@@ -270,36 +288,51 @@ program HS_Network
     ! HATANO-SASA
     xKx1 = 0d0; xKx2 = 0d0
     hs_functional_avg = 0d0; exp_minus_hs_avg = 0d0; entropy_change_avg = 0d0
+    system_entropy_change_avg = 0d0
     sum_heat_avg = 0d0; sum_entropy_avg = 0d0; sum_work_avg = 0d0; work_protocol_avg = 0d0
+    energy_change_direct_avg = 0d0; first_law_residual_avg = 0d0; first_law_abs_residual_avg = 0d0
     node_work_avg = 0d0
     do k = 1, nreal
         if (mod(k-1, progress_stride) == 0) call progress(k, nreal)
         hs_functional = 0d0; entropy_initial = 0d0; entropy_final = 0d0; entropy_change = 0d0
+        system_entropy_initial = 0d0; system_entropy_final = 0d0; system_entropy_change = 0d0
         sum_heat = 0d0; sum_entropy = 0d0; sum_work = 0d0
         protocol = 0; protocol_next = 0
         x1 = 0; f1 = 0; noise_increment = 0
         node_heat = 0d0; node_entropy = 0d0; node_work = 0d0; work_protocol = 0d0
+        energy_initial_direct = 0d0; energy_final_direct = 0d0
 
         do ii = -npast, NSTEP_PROTOCOL
             if (ii == 0) then
-                fluct = x1 - x_avg(:, 0) ! fluctuation at initial time
+                fluct = x1 - fixed_point(:, 0)
                 xKx1 = DOT_PRODUCT(fluct, MATMUL(Ko_inv_protocol(:,:,0), fluct)) ! delta x^T * Ko^{-1} * delta x
                 entropy_initial = 0.5d0*logdet_K(0) + 0.5d0*xKx1
+                fluct = x1 - x_avg(:, 0)
+                xKx1 = DOT_PRODUCT(fluct, MATMUL(K_inv_start, fluct))
+                system_entropy_initial = 0.5d0*logdet_rho_start + 0.5d0*xKx1
+                call calculate_internal_energy(N, r, a, G, 0d0, x1, energy_initial_direct, energy_work)
             endif
 
             if (ii >= 1) then
-                fluct = x1 - x_avg(:, ii) ! fluctuation at time step ii
-                fluct_prev = x1 - x_avg(:, ii-1)
+                ! Hatano-Sasa changes the steady-state potential at fixed x.
+                fluct = x1 - fixed_point(:, ii)
+                fluct_prev = x1 - fixed_point(:, ii-1)
                 xkx1 = DOT_PRODUCT(fluct, MATMUL(Ko_inv_protocol(:,:,ii), fluct))
                 xkx2 = DOT_PRODUCT(fluct_prev, MATMUL(Ko_inv_protocol(:,:,ii-1), fluct_prev))
                 hs_functional = hs_functional + 0.5d0*(logdet_K(ii) - logdet_K(ii-1)) + 0.5d0*(xkx1 - xkx2)
             endif
 
             if (ii == NSTEP_PROTOCOL) then
-                fluct = x1 - x_avg(:, NSTEP_PROTOCOL) ! fluctuation at final time
+                fluct = x1 - fixed_point(:, NSTEP_PROTOCOL)
                 xKx1 = DOT_PRODUCT(fluct, MATMUL(Ko_inv_protocol(:,:,NSTEP_PROTOCOL), fluct))
                 entropy_final = 0.5d0*logdet_K(NSTEP_PROTOCOL) + 0.5d0*xKx1
                 entropy_change = entropy_final - entropy_initial ! Delta \phi
+                fluct = x1 - x_avg(:, NSTEP_PROTOCOL)
+                xKx1 = DOT_PRODUCT(fluct, MATMUL(K_inv_end, fluct))
+                system_entropy_final = 0.5d0*logdet_rho_end + 0.5d0*xKx1
+                system_entropy_change = system_entropy_final - system_entropy_initial
+                call protocol_at_time(ii*dt, tau, bb, protocol)
+                call calculate_internal_energy(N, r, a, G, protocol, x1, energy_final_direct, energy_work)
                 exit ! no need to advance state at last protocol step
             endif
 
@@ -316,12 +349,9 @@ program HS_Network
             x_prev = x1
             call advance_hs_state_heun(N, r, a, G, protocol, protocol_next, noise_increment, f1, x1)
             if (ii >= 0 .and. ii < NSTEP_PROTOCOL) then
-                call calculate_hs_force(N, r, a, G, protocol_next, x1, f2)
-                node_heat_step = -0.5d0*(f1 + f2)*(x1 - x_prev) ! Stratonovich heat increment at each node
-                call calculate_nonconservative_force(N, GA, x_prev, nc_force_prev)
-                call calculate_nonconservative_force(N, GA, x1, nc_force_next)
-                node_work_step = 0.5d0*(nc_force_prev + nc_force_next)*(x1 - x_prev)
-                work_protocol = work_protocol + (-a(na)*x1(na)+.5d0*x1(na)*x1(na))*bb/tau*dt
+                call calculate_step_energetics(N, r, a, G, GA, protocol, protocol_next, x_prev, x1, &
+                    node_heat_step, node_work_step, work_protocol_step, x_mid, force_mid, nc_force_mid)
+                work_protocol = work_protocol + work_protocol_step
                 node_heat = node_heat + node_heat_step
                 node_work = node_work + node_work_step
                 do i = 1, N
@@ -334,6 +364,7 @@ program HS_Network
         hs_functional_avg = hs_functional_avg + hs_functional
         exp_minus_hs_avg = exp_minus_hs_avg + exp(-hs_functional)
         entropy_change_avg = entropy_change_avg + entropy_change
+        system_entropy_change_avg = system_entropy_change_avg + system_entropy_change
         node_heat_avg = node_heat_avg + node_heat
         node_entropy_avg = node_entropy_avg + node_entropy
         node_work_avg = node_work_avg + node_work
@@ -341,14 +372,22 @@ program HS_Network
         sum_heat = sum(node_heat)
         sum_entropy = sum(node_entropy)
         sum_work = sum(node_work)
+        energy_change_direct = energy_final_direct - energy_initial_direct
+        first_law_residual = energy_change_direct - (sum_heat - sum_work + work_protocol)
         sum_heat_avg = sum_heat_avg + sum_heat
         sum_entropy_avg = sum_entropy_avg + sum_entropy
         sum_work_avg = sum_work_avg + sum_work
+        energy_change_direct_avg = energy_change_direct_avg + energy_change_direct
+        first_law_residual_avg = first_law_residual_avg + first_law_residual
+        first_law_abs_residual_avg = first_law_abs_residual_avg + abs(first_law_residual)
+        write(26,*) k, energy_change_direct, sum_heat, sum_work, work_protocol, &
+            sum_heat - sum_work + work_protocol, first_law_residual
     enddo
     call cpu_time(time2_HS)
     hs_functional_avg = hs_functional_avg/nreal ! Y-value average
     exp_minus_hs_avg = exp_minus_hs_avg/nreal ! exp(-Y) average, should be close to 1 by Hatano-Sasa equality
-    entropy_change_avg = entropy_change_avg/nreal ! Delta \phi average
+    entropy_change_avg = entropy_change_avg/nreal ! Hatano-Sasa steady-state potential change
+    system_entropy_change_avg = system_entropy_change_avg/nreal
     work_protocol_avg = work_protocol_avg/nreal ! average work done by protocol
     node_heat_avg = node_heat_avg/nreal ! average heat at each node
     sum_heat_avg = sum_heat_avg/nreal ! average sum over node_heat
@@ -356,6 +395,10 @@ program HS_Network
     sum_entropy_avg = sum_entropy_avg/nreal ! average sum over node_entropy
     node_work_avg = node_work_avg/nreal ! average nonconservative work at each node
     sum_work_avg = sum_work_avg/nreal ! average sum over node_work
+    energy_change_direct_avg = energy_change_direct_avg/nreal
+    first_law_residual_avg = first_law_residual_avg/nreal
+    first_law_abs_residual_avg = first_law_abs_residual_avg/nreal
+    total_entropy_production_avg = system_entropy_change_avg + sum_entropy_avg
     energy_change_avg = sum_heat_avg - sum_work_avg + work_protocol_avg
     node_energy_avg = node_heat_avg - node_work_avg
     node_energy_avg(na) = node_energy_avg(na) + work_protocol_avg
@@ -367,17 +410,22 @@ program HS_Network
     write(*,*) 'CPU time for Hatano-Sasa: ', time2_HS - time1_HS, ' seconds.'
     write(6,*) 'Hatano-Sasa Y average = ', hs_functional_avg
     write(6,*) 'Hatano-Sasa exp(-Y) average = ', exp_minus_hs_avg
-    write(6,*) 'Entropy change average = ', entropy_change_avg ! \Delta \phi average
+    write(6,*) 'HS steady-state potential change average = ', entropy_change_avg
     ! write(6,*) 'Logdet Ko start = ', logdet_K_start
     ! write(6,*) 'Logdet Ko end = ', logdet_K_end
     ! write(6,*) 'Entropy change logdet part = ', entropy_change_logdet
     ! write(6,*) 'Entropy change quadratic average = ', entropy_change_quadratic_avg
     write(6,*) 'Excess entropy average = ', hs_functional_avg - entropy_change_avg ! excess entropy average = Y - \Delta \phi
-    write(6,*) 'Sum heat average = ', sum_heat_avg ! total heat average
-    write(6,*) 'Sum nonconservative work average = ', sum_work_avg ! total work from antisymmetric coupling
-    write(6,*) 'Work protocol average = ', work_protocol_avg ! work done by protocol average
-    write(6,*) 'Sum entropy average = ', sum_entropy_avg ! total entropy change average
-    write(6,*) 'Sum energy change average = ', energy_change_avg ! heat absorbed - nonconservative work + protocol work
+    write(6,*) 'Heat absorbed by system average = ', sum_heat_avg
+    write(6,*) 'Nonconservative work on environment average = ', sum_work_avg
+    write(6,*) 'Protocol work on system average = ', work_protocol_avg
+    write(6,*) 'Medium entropy change average = ', sum_entropy_avg
+    write(6,*) 'System entropy change average = ', system_entropy_change_avg
+    write(6,*) 'Total entropy production average = ', total_entropy_production_avg
+    write(6,*) 'Energy balance average = ', energy_change_avg ! Q_sys - W_nc_env + W_proto_on
+    write(6,*) 'Direct internal-energy change average = ', energy_change_direct_avg
+    write(6,*) 'First-law residual average = ', first_law_residual_avg
+    write(6,*) 'First-law absolute residual average = ', first_law_abs_residual_avg
 
     do i = 1, N
         write(21,*) i, node_heat_avg(i)
@@ -546,6 +594,52 @@ subroutine calculate_nonconservative_force(n, GA, x, f_nc)
         enddo
     endif
 end subroutine calculate_nonconservative_force
+
+subroutine calculate_step_energetics(n, r, a, G, GA, protocol, protocol_next, x_prev, x_next, &
+    heat_step, work_nc_env_step, work_proto_on_step, x_mid, force_mid, nc_force_mid)
+    implicit none
+    integer, intent(in) :: n
+    real(8), intent(in) :: r(n), a(n), G(n,n), GA(n,n)
+    real(8), intent(in) :: protocol, protocol_next, x_prev(n), x_next(n)
+    real(8), intent(out) :: heat_step(n), work_nc_env_step(n), work_proto_on_step
+    real(8), intent(out) :: x_mid(n), force_mid(n), nc_force_mid(n)
+    real(8) :: protocol_mid, protocol_increment
+
+    x_mid = 0.5d0*(x_prev + x_next)
+    protocol_mid = 0.5d0*(protocol + protocol_next)
+    protocol_increment = protocol_next - protocol
+
+    ! All trajectory integrals use the same Stratonovich midpoint.
+    call calculate_hs_force(n, r, a, G, protocol_mid, x_mid, force_mid)
+    heat_step = -force_mid*(x_next - x_prev)
+
+    ! W_nc_env = - integral F_nc o dx, with F_nc = A*x.
+    call calculate_nonconservative_force(n, GA, x_mid, nc_force_mid)
+    work_nc_env_step = -nc_force_mid*(x_next - x_prev)
+
+    ! The current protocol changes only r(na): r_eff(na) = r(na) + protocol.
+    work_proto_on_step = (-a(na)*x_mid(na) + 0.5d0*x_mid(na)*x_mid(na))*protocol_increment
+end subroutine calculate_step_energetics
+
+subroutine calculate_internal_energy(n, r, a, G, protocol, x, energy, qx_work)
+    implicit none
+    integer, intent(in) :: n
+    integer :: i
+    real(8), intent(in) :: r(n), a(n), G(n,n), protocol, x(n)
+    real(8), intent(out) :: energy, qx_work(n)
+    real(8) :: b_i, b_dot_x
+
+    ! U = -b^T*x - 0.5*x^T*S*x. Since x^T*A*x = 0, x^T*S*x = x^T*Q*x.
+    call calculate_hs_force(n, r, a, G, protocol, x, qx_work)
+    b_dot_x = 0d0
+    do i = 1, n
+        b_i = r(i)*a(i)
+        if (i == na) b_i = b_i + protocol*a(i)
+        b_dot_x = b_dot_x + b_i*x(i)
+        qx_work(i) = qx_work(i) - b_i
+    enddo
+    energy = -b_dot_x - 0.5d0*dot_product(x, qx_work)
+end subroutine calculate_internal_energy
 
 subroutine advance_hs_state_heun(n, r, a, G, protocol, protocol_next, noise_increment, f1, x1)
     implicit none
